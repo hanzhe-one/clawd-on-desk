@@ -127,8 +127,13 @@ function reviewStamp(result) {
 /**
  * Derive the review stamp spread into a pending permission entry.
  *
- * Resolves `{ permissionReview }`; the value is null when no command is
- * configured (the common, zero-cost case). Never rejects.
+ * Resolves `{ permissionReview, cancelled }`; `permissionReview` is null when
+ * no command is configured (the common, zero-cost case). Never rejects.
+ *
+ * `signal` is the request's abort signal. When it fires, the child is killed
+ * and the result carries `cancelled: true`; the route must then stop without
+ * creating an entry. A cancelled review is not a verdict -- it must never be
+ * stamped as "allowed" even though the process produced no answer.
  */
 async function preparePermissionReview(options = {}) {
   const {
@@ -141,6 +146,7 @@ async function preparePermissionReview(options = {}) {
     toolInput,
     cwd,
     permissionReminder,
+    signal,
   } = options;
 
   const config = readPermissionReviewConfig(ctx);
@@ -197,10 +203,24 @@ async function preparePermissionReview(options = {}) {
     command: config.command,
     timeoutMs: config.timeoutMs,
     payload: { toolName, toolInput, agentId, sessionId, cwd },
+    signal,
   });
+  if (result.cancelled === true) {
+    if (typeof ctx.permLog === "function") {
+      ctx.permLog(`external review: cancelled (${result.reason || "request changed"}) after ${Date.now() - startedAt}ms tool=${toolName || "(missing)"} session=${sessionId} agent=${agentId || "unknown"}`);
+    }
+    return { permissionReview: null, cancelled: true, reason: result.reason || "cancelled" };
+  }
   const stamp = reviewStamp(result);
   if (typeof ctx.permLog === "function") {
-    ctx.permLog(`external review: outcome=${stamp.tag} hold=${stamp.hold} exit=${stamp.exitCode === null ? "-" : stamp.exitCode} elapsed=${Date.now() - startedAt}ms tool=${toolName || "(missing)"} session=${sessionId} agent=${agentId || "unknown"}${stamp.note ? ` note=${JSON.stringify(stamp.note)}` : ""}`);
+    const detail = result.error ? ` error=${JSON.stringify(String(result.error).slice(0, 200))}` : "";
+    ctx.permLog(`external review: outcome=${stamp.tag} hold=${stamp.hold} exit=${stamp.exitCode === null ? "-" : stamp.exitCode} elapsed=${Date.now() - startedAt}ms tool=${toolName || "(missing)"} session=${sessionId} agent=${agentId || "unknown"}${stamp.note ? ` note=${JSON.stringify(stamp.note)}` : ""}${detail}`);
+    if (stamp.tag === "unavailable") {
+      // The usual cause is an interpreter that is not on the PATH the app
+      // inherited (a GUI launch gets a minimal PATH on macOS). Say so once per
+      // request instead of leaving the user with "every allow is a card".
+      ctx.permLog("external review: command could not be started — use an absolute executable path; failing closed to the human card");
+    }
   }
   return { permissionReview: stamp };
 }

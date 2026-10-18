@@ -3174,14 +3174,17 @@ function buildPermissionBubblePayload(permEntry) {
       : null,
     // The external review command's reason for the same badge. `reviewNote`
     // is the command's last stdout line, already bounded and control-stripped
-    // in the main process. Exit code 2's warning bit is recorded on the
-    // stamp and in the log; the badge already carries the warning glyph.
+    // in the main process. `reviewWarning` is exit code 2's "worth a closer
+    // look" bit; the renderer shows it as an extra clause on the badge.
     reviewTag: reviewIsReason ? "external-review" : null,
     reviewNote: reviewIsReason
       && permEntry.permissionReview
       && typeof permEntry.permissionReview.note === "string"
       ? permEntry.permissionReview.note
       : null,
+    reviewWarning: reviewIsReason
+      && permEntry.permissionReview
+      && permEntry.permissionReview.warning === true,
     detailText: typeof permEntry.detailText === "string"
       ? permEntry.detailText
       : null,

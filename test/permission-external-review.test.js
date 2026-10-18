@@ -601,4 +601,119 @@ describe("external review — route", () => {
     assert.strictEqual(entry.permissionReview.tag, "destructive-hold");
     assert.strictEqual(permission.pendingPermissions.length, 1);
   });
+
+  it("discards the review and creates no card when the client disconnects mid-review", async () => {
+    const shown = [];
+    const ctxOverrides = {
+      getPermissionReviewConfig: () => ({
+        // Long enough to be cancelled well before its timeout.
+        command: nodeCommand("setTimeout(()=>{}, 8000);"),
+        timeoutMs: 60000,
+      }),
+    };
+    const started = Date.now();
+    const res = makeRes();
+    const ctx = makeRouteCtx(ctxOverrides);
+    const permission = initPermission(ctx);
+    Object.assign(ctx, {
+      pendingPermissions: permission.pendingPermissions,
+      PASSTHROUGH_TOOLS: permission.PASSTHROUGH_TOOLS,
+      addPendingPermission: permission.addPendingPermission,
+      removePendingPermission: permission.removePendingPermission,
+      showPermissionBubble: (entry) => shown.push(entry),
+      resolvePermissionEntry: permission.resolvePermissionEntry,
+      sendPermissionResponse: permission.sendPermissionResponse,
+    });
+    handlePermissionPost(makeReq(CLAUDE_BODY), res, {
+      ctx,
+      createRequestHookRecorder: () => ({
+        accepted() {},
+        droppedByDisabled() {},
+        droppedByDnd() {},
+        droppedInvalidAgent() {},
+        droppedUnsupported() {},
+      }),
+    });
+    setTimeout(() => res.emit("close"), 100);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.deepStrictEqual(shown, [], "a disconnected request must not open a card");
+    assert.strictEqual(permission.pendingPermissions.length, 0);
+    assert.ok(Date.now() - started < 5000, "the review must not run to its 60 s timeout");
+  });
+
+  it("re-checks DND after the review and does not decide for a request that changed", async () => {
+    const shown = [];
+    let dnd = false;
+    const ctxOverrides = {
+      get doNotDisturb() { return dnd; },
+      getPermissionReviewConfig: () => ({
+        command: nodeCommand("setTimeout(()=>process.exit(0), 400);"),
+        timeoutMs: 5000,
+      }),
+    };
+    const res = makeRes();
+    const ctx = makeRouteCtx(ctxOverrides);
+    Object.defineProperty(ctx, "doNotDisturb", { get: () => dnd, configurable: true });
+    const permission = initPermission(ctx);
+    Object.assign(ctx, {
+      pendingPermissions: permission.pendingPermissions,
+      PASSTHROUGH_TOOLS: permission.PASSTHROUGH_TOOLS,
+      addPendingPermission: permission.addPendingPermission,
+      removePendingPermission: permission.removePendingPermission,
+      showPermissionBubble: (entry) => shown.push(entry),
+      resolvePermissionEntry: permission.resolvePermissionEntry,
+      sendPermissionResponse: permission.sendPermissionResponse,
+    });
+    handlePermissionPost(makeReq(CLAUDE_BODY), res, {
+      ctx,
+      createRequestHookRecorder: () => ({
+        accepted() {},
+        droppedByDisabled() {},
+        droppedByDnd() {},
+        droppedInvalidAgent() {},
+        droppedUnsupported() {},
+      }),
+    });
+    // Flip DND while the gate is running: the exit-0 result was authorized
+    // for the state at accept time and must not answer now.
+    setTimeout(() => { dnd = true; }, 100);
+    await waitFor(() => res.destroyed);
+    assert.deepStrictEqual(shown, []);
+    assert.strictEqual(permission.pendingPermissions.length, 0);
+    assert.strictEqual(res.body, "", "no allow may be written after DND lands");
+  });
+});
+
+describe("external review — cancellation", () => {
+  it("kills the child and settles as cancelled when the signal aborts", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = runPermissionReviewCommand({
+      command: nodeCommand("setTimeout(()=>{}, 10000);"),
+      timeoutMs: 60000,
+      payload: {},
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort("client-disconnected"), 100);
+    const result = await pending;
+    assert.strictEqual(result.cancelled, true);
+    assert.strictEqual(result.tag, "cancelled");
+    assert.strictEqual(result.reason, "client-disconnected");
+    assert.ok(Date.now() - started < 5000, "cancellation must not wait for the timeout");
+  });
+
+  it("does not spawn anything when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort("gone");
+    let spawned = false;
+    const result = await runPermissionReviewCommand({
+      command: ["node"],
+      timeoutMs: 5000,
+      payload: {},
+      signal: controller.signal,
+      spawnImpl() { spawned = true; throw new Error("must not spawn"); },
+    });
+    assert.strictEqual(spawned, false);
+    assert.strictEqual(result.cancelled, true);
+  });
 });

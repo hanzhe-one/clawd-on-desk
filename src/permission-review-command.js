@@ -35,8 +35,10 @@ const MAX_COMMAND_TOTAL_LENGTH = 16 * 1024;
 
 // A review may print as much as it likes; only this much is retained. The note
 // shown to a human is the last non-empty stdout line, further bounded below.
+// 160 characters is roughly three lines in a card badge at the largest text
+// scale, and short enough to stay readable in Telegram/Feishu.
 const MAX_STDOUT_BYTES = 64 * 1024;
-const MAX_NOTE_LENGTH = 500;
+const MAX_NOTE_LENGTH = 160;
 
 // Bounded concurrency: a burst of permission requests must not fork a review
 // process per request without limit. Beyond this the request fails toward the
@@ -130,18 +132,62 @@ function buildReviewPayload({ toolName, toolInput, agentId, sessionId, cwd } = {
 }
 
 function terminateReviewChild(child) {
-  if (!child) return;
-  try { child.kill(); } catch {}
+  if (!child || typeof child !== "object") return;
+  const pid = typeof child.pid === "number" ? child.pid : null;
+  if (process.platform === "win32") {
+    // child.kill() only terminates the direct child; a gate that runs a shell
+    // wrapper would leave its descendants behind. taskkill /T walks the tree.
+    if (pid !== null) {
+      try {
+        const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        if (killer && typeof killer.on === "function") killer.on("error", () => {});
+      } catch {}
+    }
+    try { child.kill(); } catch {}
+    return;
+  }
+  // POSIX: the child was spawned detached, so it leads its own process group.
+  // A negative pid signals the whole group, reaching a shell wrapper's
+  // children as well.
+  if (pid !== null) {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {}
+  }
+  try { child.kill("SIGKILL"); } catch {}
+}
+
+function cancelledReviewResult(reason) {
+  return {
+    hold: true,
+    tag: "cancelled",
+    exitCode: null,
+    note: null,
+    warning: false,
+    cancelled: true,
+    reason: typeof reason === "string" && reason ? reason : "cancelled",
+  };
 }
 
 /**
  * Run the configured command once.
  *
+ * `signal` is an AbortSignal owned by the request. When it aborts, the child
+ * (and its process group) is killed and the promise settles with a `cancelled`
+ * stamp; nothing waits for the timeout. This is the "discard late results once
+ * the request or its authorization changes" half of the contract: the caller
+ * aborts from `res.on("close")`, a DND flip, or an agent gate flip, and never
+ * creates an entry from a result nobody can act on.
+ *
  * Resolves, never rejects. The returned object is the stamp the permission
  * layer consumes:
  *   { hold: false, tag: "allowed", exitCode: 0, note, warning: false }
  *   { hold: true,  tag: "exit-1" | "exit-2" | "exit-<n>" | "signal" |
- *                         "timeout" | "unavailable" | "busy" |
+ *                         "timeout" | "unavailable" | "busy" | "cancelled" |
  *                         "payload-too-large", exitCode, note, warning }
  */
 function runPermissionReviewCommand(options = {}) {
@@ -154,6 +200,10 @@ function runPermissionReviewCommand(options = {}) {
       note: null,
       warning: false,
     });
+  }
+  const signal = options.signal || null;
+  if (signal && signal.aborted === true) {
+    return Promise.resolve(cancelledReviewResult(signal.reason));
   }
   if (activeReviews.size >= MAX_CONCURRENT_REVIEWS) {
     return Promise.resolve({
@@ -195,6 +245,7 @@ function runPermissionReviewCommand(options = {}) {
     let settled = false;
     let timedOut = false;
     let timer = null;
+    let abortListener = null;
     let stdoutBytes = 0;
     let stdout = "";
     // Decode incrementally so a multi-byte character split across chunks is
@@ -207,6 +258,9 @@ function runPermissionReviewCommand(options = {}) {
       settled = true;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (signal && abortListener) {
+        try { signal.removeEventListener("abort", abortListener); } catch {}
+      }
       activeReviews.delete(entry);
       resolve(result);
     };
@@ -216,6 +270,9 @@ function runPermissionReviewCommand(options = {}) {
         shell: false,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
+        // POSIX only: a process group of its own is what makes terminateReviewChild
+        // able to reach a shell wrapper's children. Windows uses taskkill /T.
+        detached: process.platform !== "win32",
       });
     } catch (err) {
       finish({
@@ -242,6 +299,14 @@ function runPermissionReviewCommand(options = {}) {
       });
     };
     activeReviews.add(entry);
+
+    if (signal) {
+      abortListener = () => {
+        terminateReviewChild(child);
+        finish(cancelledReviewResult(signal.reason));
+      };
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
 
     // The result is bounded by MAX_STDOUT_BYTES; extra bytes are drained (so
     // the child never blocks on a full pipe) and discarded.

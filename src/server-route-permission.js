@@ -629,6 +629,81 @@ function tryRemoteOnlyApproval(ctx, fields) {
   return { handled: true, resolution: "remote" };
 }
 
+const REVIEW_CANCELLED = Symbol("permission-review-cancelled");
+
+// Request-scoped external review (#995).
+//
+// The review is awaited before the permEntry exists, so the usual
+// `res.on("close", abortHandler)` registration in every branch is too late: a
+// client that disconnects while the gate runs would leave a ghost card and a
+// child process occupying a concurrency slot. This scopes the review to the
+// request:
+//
+//   - `close` on the response aborts the child immediately;
+//   - after the await, DND / agent-disabled / bubble-toggle changes that
+//     happened in the meantime are re-checked, because the result was
+//     authorized for the state at accept time, not for the state now;
+//   - a cancelled review never becomes a verdict. The caller's onCancelled
+//     fallback runs and no entry is created.
+//
+// `res` may be null (opencode v1): that branch has already answered 200 and
+// the response's `close` says nothing about the request, which lives in the
+// plugin's bridge until the reverse reply.
+// Only the gates evaluated BEFORE the review need re-checking. The bubble
+// toggles are intentionally absent: a mid-review flip is handled by the
+// branch's own post-review code (which can still route the entry to the
+// remote-only channel), so treating it as a cancellation here would be wrong.
+function reviewAuthorizationChanged(ctx, agentId) {
+  try {
+    if (ctx.doNotDisturb) return "dnd";
+    if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled(agentId)) return "agent-disabled";
+  } catch (_err) {
+    return "authorization-unreadable";
+  }
+  return null;
+}
+
+async function settlePermissionReview(ctx, res, options = {}) {
+  const { onCancelled, ...reviewOptions } = options;
+  const controller = new AbortController();
+  const abortForClose = () => {
+    if (!controller.signal.aborted) controller.abort("client-disconnected");
+  };
+  const watched = !!res && typeof res.once === "function";
+  if (watched) res.once("close", abortForClose);
+  let result;
+  try {
+    result = await preparePermissionReview({
+      ctx,
+      ...reviewOptions,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // preparePermissionReview resolves by contract; this is a defensive net so
+    // a surprise cannot leave the request unanswered.
+    result = { permissionReview: null, cancelled: true, reason: "review-error" };
+    if (typeof ctx.permLog === "function") {
+      ctx.permLog(`external review: unexpected failure (${err && err.message ? err.message : err}) tool=${options.toolName || "(missing)"} session=${options.sessionId}`);
+    }
+  } finally {
+    if (watched) res.removeListener("close", abortForClose);
+  }
+
+  let reason = result.cancelled === true
+    ? (result.reason || "cancelled")
+    : (controller.signal.aborted ? "client-disconnected" : null);
+  if (!reason && res && res.destroyed === true) reason = "client-disconnected";
+  const changed = reason ? null : reviewAuthorizationChanged(ctx, options.agentId);
+  if (changed) reason = changed;
+
+  if (!reason) return result.permissionReview;
+  if (typeof ctx.permLog === "function") {
+    ctx.permLog(`external review: request no longer actionable (${reason}) — discarding result tool=${options.toolName || "(missing)"} session=${options.sessionId} agent=${options.agentId || "unknown"}`);
+  }
+  if (typeof onCancelled === "function") onCancelled(reason);
+  return REVIEW_CANCELLED;
+}
+
 function startRemoteApproval(ctx, permEntry) {
   if (
     permEntry
@@ -889,9 +964,8 @@ function handlePermissionPost(req, res, options) {
           // Optional external review (#995), settled before the remote-only and
           // automatic-allow paths below. Conditionally awaited so the feature
           // being off keeps the handler synchronous.
-          const { permissionReview } = isPermissionReviewEnabled(ctx)
-            ? await preparePermissionReview({
-              ctx,
+          const permissionReview = isPermissionReviewEnabled(ctx)
+            ? await settlePermissionReview(ctx, res, {
               agentId,
               sessionId,
               sessionAutomationIdentity,
@@ -900,8 +974,19 @@ function handlePermissionPost(req, res, options) {
               toolInput: rawInput,
               cwd: typeof data.cwd === "string" ? data.cwd : "",
               permissionReminder: permissionReminder.permissionReminder,
+              // A v2 permission request blocks on its response: a request
+              // whose authorization changed mid-review (DND, agent disabled)
+              // gets the same no-decision the pre-review gate would have sent.
+              // A disconnected client has nobody left to answer.
+              onCancelled: () => {
+                if (!res.headersSent && !res.destroyed) sendOpencodeV2PermissionNoDecision(res);
+              },
             })
-            : { permissionReview: null };
+            : null;
+          if (permissionReview === REVIEW_CANCELLED) {
+            recordRequestHookEvent.accepted();
+            return;
+          }
 
           // Global bubble switch only means "no desktop window": Telegram /
           // Feishu remote-only approval stays alive (same contract as zcode).
@@ -1093,9 +1178,13 @@ function handlePermissionPost(req, res, options) {
         // the automatic-allow path in showPermissionBubble(). Conditionally
         // awaited: with the feature off this branch stays synchronous, which
         // the opencode-family ACK/enqueue contract depends on.
-        const { permissionReview } = isPermissionReviewEnabled(ctx)
-          ? await preparePermissionReview({
-            ctx,
+        //
+        // `null` response on purpose: this branch already answered 200, so the
+        // response's `close` says nothing about the request -- the request
+        // lives in the plugin's bridge until the reverse reply, and its fate
+        // is resolved through the entry's own lifecycle.
+        const permissionReview = isPermissionReviewEnabled(ctx)
+          ? await settlePermissionReview(ctx, null, {
             agentId,
             sessionId,
             sessionAutomationIdentity,
@@ -1105,7 +1194,11 @@ function handlePermissionPost(req, res, options) {
             cwd: typeof data.cwd === "string" ? data.cwd : "",
             permissionReminder: permissionReminder.permissionReminder,
           })
-          : { permissionReview: null };
+          : null;
+        if (permissionReview === REVIEW_CANCELLED) {
+          recordRequestHookEvent.accepted();
+          return;
+        }
 
         const permEntry = {
           res: null,
@@ -1362,9 +1455,8 @@ function handlePermissionPost(req, res, options) {
         // Optional external review (#995). A held request must not be claimed
         // for a bubble-less automatic allow: wouldAutoAllowPermission() sees
         // the frozen stamp and answers false, so Codex keeps its native prompt.
-        const { permissionReview } = isPermissionReviewEnabled(ctx)
-          ? await preparePermissionReview({
-            ctx,
+        const permissionReview = isPermissionReviewEnabled(ctx)
+          ? await settlePermissionReview(ctx, res, {
             agentId: "codex",
             sessionId,
             sessionAutomationIdentity,
@@ -1378,8 +1470,17 @@ function handlePermissionPost(req, res, options) {
               || (typeof data.cwd === "string" ? data.cwd : "")
               || "",
             permissionReminder: permissionReminder.permissionReminder,
+            // Codex's fallback is its own native prompt: hand it back the
+            // same way the pre-review DND/disabled gates do.
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendCodexPermissionNoDecision(res);
+            },
           })
-          : { permissionReview: null };
+          : null;
+        if (permissionReview === REVIEW_CANCELLED) {
+          recordRequestHookEvent.accepted();
+          return;
+        }
 
         const codexAutomationClaim = shouldClaimCodexPermissionForAutomation(ctx, data, {
           agentId: "codex",
@@ -1559,9 +1660,8 @@ function handlePermissionPost(req, res, options) {
 
         // Optional external review (#995), settled before the automatic-allow
         // path in showPermissionBubble().
-        const { permissionReview } = isPermissionReviewEnabled(ctx)
-          ? await preparePermissionReview({
-            ctx,
+        const permissionReview = isPermissionReviewEnabled(ctx)
+          ? await settlePermissionReview(ctx, res, {
             agentId: "qwen-code",
             sessionId,
             sessionAutomationIdentity,
@@ -1570,8 +1670,12 @@ function handlePermissionPost(req, res, options) {
             toolInput: rawInput,
             cwd: qwenSessionOptions.cwd || "",
             permissionReminder: permissionReminder.permissionReminder,
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendQwenCodePermissionNoDecision(res);
+            },
           })
-          : { permissionReview: null };
+          : null;
+        if (permissionReview === REVIEW_CANCELLED) return;
 
         const permEntry = {
           res,
@@ -1715,10 +1819,9 @@ function handlePermissionPost(req, res, options) {
           && !ctx.isAgentPermissionsEnabled("zcode");
         // Optional external review (#995), settled before either the
         // remote-only or the local automatic-allow path can decide.
-        const zcodeReviewResult = agentGateOff || !isPermissionReviewEnabled(ctx)
-          ? { permissionReview: null }
-          : await preparePermissionReview({
-            ctx,
+        const permissionReview = agentGateOff || !isPermissionReviewEnabled(ctx)
+          ? null
+          : await settlePermissionReview(ctx, res, {
             agentId: "zcode",
             sessionId,
             sessionAutomationIdentity,
@@ -1727,8 +1830,11 @@ function handlePermissionPost(req, res, options) {
             toolInput: rawInput,
             cwd: zcodeSessionOptions.cwd || "",
             permissionReminder: permissionReminder.permissionReminder,
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendZcodePermissionNoDecision(res);
+            },
           });
-        const { permissionReview } = zcodeReviewResult;
+        if (permissionReview === REVIEW_CANCELLED) return;
         if (!agentGateOff && !arePermissionBubblesEnabled(ctx)) {
           recordRequestHookEvent.accepted();
           const remoteOnlyResult = tryRemoteOnlyApproval(ctx, {
@@ -1903,9 +2009,8 @@ function handlePermissionPost(req, res, options) {
         }
 
         // Optional external review (#995).
-        const { permissionReview } = isPermissionReviewEnabled(ctx)
-          ? await preparePermissionReview({
-            ctx,
+        const permissionReview = isPermissionReviewEnabled(ctx)
+          ? await settlePermissionReview(ctx, res, {
             agentId: "copilot-cli",
             sessionId,
             sessionAutomationIdentity,
@@ -1914,8 +2019,12 @@ function handlePermissionPost(req, res, options) {
             toolInput: rawInput,
             cwd: copilotSessionOptions.cwd || "",
             permissionReminder: permissionReminder.permissionReminder,
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendCopilotPermissionNoDecision(res);
+            },
           })
-          : { permissionReview: null };
+          : null;
+        if (permissionReview === REVIEW_CANCELLED) return;
 
         const permEntry = {
           res,
@@ -2068,10 +2177,9 @@ function handlePermissionPost(req, res, options) {
         // Optional external review (#995). DSH's ApprovalRequest carries no
         // tool arguments, so the command receives an empty toolInput; that
         // limitation is documented with the setting.
-        const dshReviewResult = agentGateOff || !isPermissionReviewEnabled(ctx)
-          ? { permissionReview: null }
-          : await preparePermissionReview({
-            ctx,
+        const permissionReview = agentGateOff || !isPermissionReviewEnabled(ctx)
+          ? null
+          : await settlePermissionReview(ctx, res, {
             agentId,
             sessionId,
             sessionAutomationIdentity,
@@ -2082,8 +2190,11 @@ function handlePermissionPost(req, res, options) {
               || (typeof data.cwd === "string" ? data.cwd : "")
               || "",
             permissionReminder: permissionReminder.permissionReminder,
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendDshPermissionNoDecision(res);
+            },
           });
-        const { permissionReview } = dshReviewResult;
+        if (permissionReview === REVIEW_CANCELLED) return;
 
         if (shouldBypassDshBubble(ctx)) {
           recordRequestHookEvent.accepted();
@@ -2322,9 +2433,8 @@ function handlePermissionPost(req, res, options) {
         };
         // Optional external review (#995), settled before the automatic-allow
         // path in showPermissionBubble().
-        const { permissionReview } = isPermissionReviewEnabled(ctx)
-          ? await preparePermissionReview({
-            ctx,
+        const permissionReview = isPermissionReviewEnabled(ctx)
+          ? await settlePermissionReview(ctx, res, {
             agentId: "hermes",
             sessionId,
             sessionAutomationIdentity,
@@ -2333,8 +2443,12 @@ function handlePermissionPost(req, res, options) {
             toolInput: rawInput,
             cwd: hermesSessionOptions.cwd || "",
             permissionReminder: permissionReminder.permissionReminder,
+            onCancelled: () => {
+              if (!res.headersSent && !res.destroyed) sendHermesPermissionNoDecision(res);
+            },
           })
-          : { permissionReview: null };
+          : null;
+        if (permissionReview === REVIEW_CANCELLED) return;
         ctx.permLog(`HERMES PERMISSION: tool=${toolName} session=${sessionId}`);
         ctx.updateSession(sessionId, "notification", "PermissionRequest", hermesSessionOptions);
 
@@ -2503,9 +2617,12 @@ function handlePermissionPost(req, res, options) {
       // verdict is frozen on the entry; decision helpers stay synchronous.
       // The synchronous enable check keeps this handler in one execution
       // segment when the feature is off (README: opencode v1 ACK + enqueue).
-      const { permissionReview } = isPermissionReviewEnabled(ctx)
-        ? await preparePermissionReview({
-          ctx,
+      //
+      // The response is scoped here: every branch below registers its own
+      // abortHandler only AFTER the entry exists, which is too late for a
+      // client that disconnects while the gate runs.
+      const permissionReview = isPermissionReviewEnabled(ctx)
+        ? await settlePermissionReview(ctx, res, {
           agentId: permAgentId,
           sessionId,
           sessionAutomationIdentity,
@@ -2516,8 +2633,16 @@ function handlePermissionPost(req, res, options) {
             ? existingSession.cwd
             : (typeof data.cwd === "string" ? data.cwd : ""),
           permissionReminder: permissionReminder.permissionReminder,
+          // The Claude/CodeBuddy fallback is the native chat prompt: destroy
+          // the connection so no decision is forged, then stop.
+          onCancelled: () => {
+            if (!res.headersSent && !res.destroyed) {
+              try { res.destroy(); } catch {}
+            }
+          },
         })
-        : { permissionReview: null };
+        : null;
+      if (permissionReview === REVIEW_CANCELLED) return;
 
       if (shouldBypassCCBubble(ctx, interaction, permAgentId)) {
         recordRequestHookEvent.accepted();

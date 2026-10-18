@@ -13,7 +13,7 @@ yet). Quit Clawd, edit the file, and start it again:
 ```json
 {
   "permissionAutomationMode": "auto-tools",
-  "permissionReviewCommand": ["python", "C:\\gates\\review.py"],
+  "permissionReviewCommand": ["/usr/local/bin/python3", "/Users/me/gates/review.py"],
   "permissionReviewTimeoutMs": 5000
 }
 ```
@@ -24,6 +24,12 @@ yet). Quit Clawd, edit the file, and start it again:
   value is rejected at load time and normalizes to off.
 - `permissionReviewTimeoutMs` — how long one review may run. Default `5000`,
   allowed range `250`–`60000`.
+
+Use an **absolute path** for the executable. Clawd launched from Finder or a
+desktop shortcut inherits a minimal `PATH`; a bare `python` / `node` then fails
+with `ENOENT`, and because that fails closed, every automatic allow would
+quietly turn into a card. The log records the command as `unavailable` when
+this happens.
 
 The conceptual names used in issue #995 map to these flat keys:
 `permissionAutomation.externalReview.command` → `permissionReviewCommand`,
@@ -62,8 +68,10 @@ The exit code is the whole answer:
 | Any other code, signal, timeout, missing/non-executable command, unreadable settings, over-limit payload | Pause at the human card. A failed review is never retried into an allow. |
 
 Pretty-printing more than one line is fine; only the last non-empty line is
-used, stripped of control characters and bounded to 500 characters. Output is
-never parsed for an allow/deny decision.
+used, stripped of control characters and bounded to 160 characters. The note is
+shown on the local bubble and forwarded verbatim into Telegram/Feishu cards, so
+a gate that echoes command text will echo it there too — do not print secrets.
+Output is never parsed for an allow/deny decision.
 
 ## Scope and safety
 
@@ -77,9 +85,19 @@ never parsed for an allow/deny decision.
   created later (sweep), and the remote-only Telegram/Feishu path all see the
   frozen verdict. A "late result" cannot exist because the allow cannot be
   emitted first.
+- **Request-scoped.** If the request goes away while the command runs — the
+  agent drops the connection, the user presses Esc, the hook process is killed
+  — the child is terminated and its result is discarded; no card is created.
+  DND or an agent-disable that lands mid-review is re-checked the same way,
+  because the result was authorized for the state at accept time.
 - **Fail closed.** A request that is pending when a session grant arrives is
   not swept unless it was explicitly cleared by exit `0`. An entry that never
   carried a verdict is treated as not reviewed.
+- **Session trust stays available.** "Don't ask again in this session" is a
+  human action, so it is still offered when the configured command has not
+  cleared the current request. The grant applies to later requests, which are
+  reviewed normally; it does not release other pending requests whose gate did
+  not clear them.
 - **Bounded.** At most four reviews run at once; further requests pause for a
   human without starting a process. Captured stdout is capped at 64 KiB (stderr
   is drained and discarded), and stdin payloads above 1 MiB are refused.
@@ -89,9 +107,10 @@ never parsed for an allow/deny decision.
   executable. In this first release the prefs file is the only writer. The
   command runs with Clawd's own privileges and receives the tool input, so only
   configure a program you trust.
-- **Process cleanup.** Clawd terminates the process it started on timeout or
-  when it quits. Descendants that the command spawns itself are not tracked; a
-  gate script should clean up its own children.
+- **Process cleanup.** Clawd terminates the process group it started on timeout,
+  cancellation, or quit: a negative PID on POSIX, `taskkill /T` on Windows. That
+  reaches a shell wrapper's children; descendants that detach into a new group
+  of their own are still the script's responsibility.
 
 Sessions that never send a `PermissionRequest` to Clawd — Claude Code with
 `--dangerously-skip-permissions` or `defaultMode: "auto"`, for example — are
