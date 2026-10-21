@@ -54,6 +54,31 @@ test("rejects a target removed or changed during asynchronous executable lookup"
   }
 });
 
+test("a normal session update during executable lookup does not cancel the action",async()=>{
+  let h;
+  // updateSession() rebuilds the object for every lifecycle event; the new
+  // object carries identical attach-relevant fields.
+  h=harness({findExecutable:async()=>{h.replace({...session,state:"working",updatedAt:Date.now()});return "C:\\opencode.exe";}});
+  assert.deepEqual(await h.open("s"),{status:"ok"});
+  assert.equal(h.launches.length,1);
+});
+
+test("still rejects a session removed, disabled or retargeted during lookup",async()=>{
+  for (const {replacement, enabled} of [
+    {replacement:null},
+    {replacement:{...session},enabled:false},
+    {replacement:{...session,opencodeAttachUrl:null}},
+    {replacement:{...session,cwd:"C:\\elsewhere"}},
+    {replacement:{...session,rawSessionId:"opencode:ses_other"}},
+  ]) {
+    let h; const extra={findExecutable:async()=>{h.replace(replacement);return "C:\\opencode.exe";}};
+    if (enabled === false) extra.isAgentEnabled=()=>false;
+    h=harness(extra);
+    assert.deepEqual(await h.open("s"),{status:"unavailable"},JSON.stringify(replacement));
+    assert.equal(h.launches.length,0);
+  }
+});
+
 test("coalesces double-clicks and releases the lock after failure",async()=>{
   let resolve; const h=harness({findExecutable:()=>new Promise(r=>{resolve=r;})});
   const first=h.open("s"); await new Promise(r=>setImmediate(r));

@@ -79,8 +79,14 @@ function createOpencodeSessionAttacher(options = {}) {
       catch { return { status: "error", reason: "directory" }; }
       const executable = await find();
       if (!executable) return { status: "error", reason: "opencode" };
+      // `state.updateSession()` rebuilds the session object for every ordinary
+      // event, so reference equality would cancel this action whenever a
+      // PostToolUse lands during the asynchronous lookup. Re-derive the
+      // validated target from the current session instead: an unchanged
+      // identity/URL/directory still launches, while a removed session or a
+      // changed/invalid target is still rejected.
       const current = getSession(id);
-      if (current !== session || !isEnabled("opencode")
+      if (!isEnabled("opencode")
         || JSON.stringify(getOpencodeAttachTarget(current, platform)) !== JSON.stringify(target)) {
         return { status: "unavailable" };
       }
