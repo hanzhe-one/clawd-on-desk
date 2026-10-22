@@ -522,7 +522,27 @@ export function resolveOpencodeServeAttachUrl(agentId, argv, value) {
   // Only the first real command token counts, so a TUI directory argument can
   // never be mistaken for serve mode.
   const bundledScript = typeof argv[1] === "string" && /\.(?:c|m)?js$/i.test(argv[1]);
-  const commandIndex = bundledScript ? 2 : 1;
+  let commandIndex = bundledScript ? 2 : 1;
+  // OpenCode v1 accepts its global logging/boolean options before the command.
+  // Consume only known options and their values; scanning for any later "serve"
+  // would mistake an option value, TUI project, or another command's argument.
+  while (commandIndex < argv.length) {
+    const option = argv[commandIndex];
+    if (option === "--log-level" || option === "--logLevel") {
+      if (!/^(?:DEBUG|INFO|WARN|ERROR)$/.test(argv[commandIndex + 1])) return null;
+      commandIndex += 2;
+    } else if (/^--(?:log-level|logLevel)=(?:DEBUG|INFO|WARN|ERROR)$/.test(option)) {
+      commandIndex++;
+    } else if (/^--no-(?:print-logs|printLogs|pure)$/.test(option)) {
+      // Negated booleans never consume the following token in yargs.
+      commandIndex++;
+    } else if (/^--(?:print-logs|printLogs|pure)(?:=(?:true|false))?$/.test(option)) {
+      commandIndex++;
+      if (!option.includes("=") && ["true", "false"].includes(argv[commandIndex])) commandIndex++;
+    } else {
+      break;
+    }
+  }
   if (argv[commandIndex] !== "serve") return null;
   try {
     const raw = String(value || "");

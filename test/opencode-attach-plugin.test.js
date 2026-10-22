@@ -44,6 +44,31 @@ test("explicit serve mode and root HTTP URL are required; internal TUI URL is ne
   assert.equal(get("mimocode",["mimo.exe","serve"],"http://localhost:4096/"),null);
 });
 
+test("serve accepts known leading global options without mistaking option values or TUI arguments for commands",()=>{
+  const get=core.resolveOpencodeServeAttachUrl;
+  const url="http://127.0.0.1:4096/";
+  for(const host of [["opencode.exe"],["bun","B:/~BUN/root/src/index.js"]]){
+    for(const prefix of [
+      ["--log-level","ERROR"], ["--log-level=DEBUG"],
+      ["--logLevel","ERROR"], ["--logLevel=INFO","--printLogs"],
+      ["--print-logs"], ["--no-print-logs"], ["--print-logs=false"],
+      ["--print-logs","false"], ["--no-pure"],
+      ["--print-logs","--log-level","INFO"],
+      ["--log-level=WARN","--print-logs=true","--pure=false"],
+    ]) assert.equal(get("opencode",[...host,...prefix,"serve","--port","4096"],url),url,JSON.stringify(prefix));
+    for(const args of [
+      ["--log-level"], ["--log-level","serve"], ["--log-level=serve"],
+      ["--unknown","serve"], ["--unknown=value","serve"], ["--","serve"],
+      ["--print-logs=serve"], ["--print-logs","project","serve"],
+      ["--no-print-logs","false","serve"], ["--no-pure","true","serve"],
+      ["--no-print-logs=false","serve"],
+      ["--log-level","ERROR","attach","serve"],
+      ["--print-logs","run","serve"], ["--log-level","ERROR","project\\serve"],
+      ["--help","serve"], ["--version","serve"],
+    ]) assert.equal(get("opencode",[...host,...args],url),null,JSON.stringify(args));
+  }
+});
+
 test("each directory instance advertises its own endpoint, including metadata-only title updates",async()=>{
   const plugin=core.createOpencodeFamilyPlugin(params);plugins.push(plugin);
   const a=path.join(home,"a"),b=path.join(home,"b");
